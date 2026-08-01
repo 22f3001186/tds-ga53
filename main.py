@@ -8,8 +8,9 @@ from urllib.parse import urlparse
 
 app = FastAPI()
 
-SECRET_FILE = "/home/agent/service-account.json"
 HOME = "/home/agent"
+WORKSPACE = "/home/agent/workspace"
+SECRET_FILE = "/home/agent/service-account.json"
 WRITE_ROOT = "/data/agent/outbox"
 
 ALLOWED_HOSTS = {
@@ -21,63 +22,81 @@ ALLOWED_HOSTS = {
 class GuardRequest(BaseModel):
     tool: str
 
-    # For bash
     command: Optional[str] = None
 
-    # For write_file
     path: Optional[str] = None
     content: Optional[str] = None
 
-    # For http_request
     method: Optional[str] = None
     url: Optional[str] = None
 
 
-def normalize(path: str):
+def expand_path(path: str, base: str = WORKSPACE):
     path = path.replace("$HOME", HOME)
     path = path.replace("~", HOME)
-    return os.path.normpath(path)
+
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+
+    return os.path.normpath(os.path.join(base, path))
 
 
-def is_inside(path: str, root: str):
-    full = os.path.normpath(path)
+def inside(path: str, root: str):
+    path = os.path.normpath(path)
     root = os.path.normpath(root)
-    return full == root or full.startswith(root + os.sep)
+    return path == root or path.startswith(root + os.sep)
 
 
-def check_bash(command: str):
+def reads_secret(command: str):
 
-    if command is None:
+    if not command:
         return False
 
     cmd = command.replace("$HOME", HOME)
     cmd = cmd.replace("~", HOME)
 
-    # Direct access
-    if SECRET_FILE in cmd:
-        return False
-
-    # Any mention of the secret file
-    if "service-account.json" in cmd:
-        return False
-
-    # Try decoding possible base64 strings
-    tokens = re.findall(r"[A-Za-z0-9+/=]{8,}", command)
-
-    for token in tokens:
+    # decode any base64 blobs
+    for token in re.findall(r"[A-Za-z0-9+/=]{12,}", cmd):
         try:
             decoded = base64.b64decode(token).decode(errors="ignore")
-
-            if SECRET_FILE in decoded:
-                return False
-
-            if "service-account.json" in decoded:
-                return False
-
+            cmd += " " + decoded
         except Exception:
             pass
 
-    return True
+    read_cmds = [
+        "cat",
+        "less",
+        "more",
+        "head",
+        "tail",
+        "grep",
+        "sed",
+        "awk",
+        "cp"
+    ]
+
+    if not any(cmd_name in cmd for cmd_name in read_cmds):
+        return False
+
+    if SECRET_FILE in cmd:
+        return True
+
+    if "$HOME/service-account.json" in command:
+        return True
+
+    if "~/service-account.json" in command:
+        return True
+
+    for token in re.findall(r"(/[^\s;|]+|\.\.?/[^\s;|]+)", cmd):
+        resolved = expand_path(token)
+
+        if resolved == SECRET_FILE:
+            return True
+
+    if "service-account.json" in cmd:
+        return True
+
+    return False
 
 
 @app.post("/check")
@@ -85,18 +104,18 @@ async def check(body: GuardRequest):
 
     if body.tool == "bash":
 
-        if check_bash(body.command):
+        if reads_secret(body.command):
             return {
-                "decision": "allow",
-                "reason": "Safe command."
+                "decision": "block",
+                "reason": "Restricted file access."
             }
 
         return {
-            "decision": "block",
-            "reason": "Restricted file access."
+            "decision": "allow",
+            "reason": "Command allowed."
         }
 
-    elif body.tool == "write_file":
+    if body.tool == "write_file":
 
         if body.path is None:
             return {
@@ -104,9 +123,9 @@ async def check(body: GuardRequest):
                 "reason": "Missing path."
             }
 
-        path = normalize(body.path)
+        resolved = expand_path(body.path, WRITE_ROOT)
 
-        if is_inside(path, WRITE_ROOT):
+        if inside(resolved, WRITE_ROOT):
             return {
                 "decision": "allow",
                 "reason": "Write permitted."
@@ -114,10 +133,10 @@ async def check(body: GuardRequest):
 
         return {
             "decision": "block",
-            "reason": "Outside write directory."
+            "reason": "Write outside allowed directory."
         }
 
-    elif body.tool == "http_request":
+    if body.tool == "http_request":
 
         if body.url is None:
             return {
@@ -125,7 +144,7 @@ async def check(body: GuardRequest):
                 "reason": "Missing URL."
             }
 
-        host = urlparse(body.url).hostname or ""
+        host = (urlparse(body.url).hostname or "").lower()
 
         if host in ALLOWED_HOSTS:
             return {
@@ -140,5 +159,5 @@ async def check(body: GuardRequest):
 
     return {
         "decision": "allow",
-        "reason": "Unknown tool."
+        "reason": "Tool allowed."
     }
